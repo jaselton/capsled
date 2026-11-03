@@ -5,7 +5,7 @@ Blinks the Caps Lock light on a Mac keyboard (tested on a Logitech MX Keys Mac o
 ## Install on a Mac
 
 ```
-gh repo clone johnaselton-coder/capsled ~/capsled && ~/capsled/install.sh "MX Keys"
+gh repo clone jaselton/capsled ~/capsled && ~/capsled/install.sh "MX Keys"
 ```
 
 Needs the Xcode Command Line Tools (`xcode-select --install`). The first run may ask for Input Monitoring permission in System Settings > Privacy & Security.
