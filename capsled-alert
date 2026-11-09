@@ -1,0 +1,389 @@
+#!/bin/bash
+# Durable Caps Lock blink for macOS. Compatible with bash 3.2.
+# State: ~/.capsled-alert/<tag>.on (marker) and <tag>.pid (loop pid).
+# Loop: ~/bin/capsled 3 "$CAPSLED_KB" ; sleep 4, until the marker is gone
+# or CAPSLED_MAX_HOURS (default 12) have passed since the marker was refreshed.
+set -u
+
+DIR="${HOME}/.capsled-alert"
+KB="${CAPSLED_KB:-MX Keys}"
+MAXH="${CAPSLED_MAX_HOURS:-12}"
+
+usage() {
+  echo "Usage: capsled-alert start [tag] | stop [tag] | status" >&2
+}
+
+case "$MAXH" in
+  ''|*[!0-9]*)
+    echo "capsled-alert: CAPSLED_MAX_HOURS must be a whole number of hours" >&2
+    exit 1
+    ;;
+esac
+MAXH=$((10#$MAXH))
+if [ "$MAXH" -gt 8760 ]; then
+  echo "capsled-alert: CAPSLED_MAX_HOURS is too large" >&2
+  exit 1
+fi
+
+sanitize() {
+  raw=${1:-}
+  if [ -z "$raw" ]; then
+    printf '%s\n' default
+    return
+  fi
+  cleaned=$(printf '%s' "$raw" | tr -c 'A-Za-z0-9._-' '_' | cut -c1-64)
+  case "$cleaned" in
+    ''|.|..) printf '%s\n' default ;;
+    *) printf '%s\n' "$cleaned" ;;
+  esac
+}
+
+file_mtime() {
+  stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || true
+}
+
+# True when pid is a live capsled-alert loop for this tag.
+# Never treats pid 0 or 1 as ours (pid 0 would signal the process group).
+ours() {
+  pid=${1:-}
+  want=${2:-}
+  case "$pid" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  [ "$pid" -ge 2 ] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  cmd=$(ps -p "$pid" -o args= 2>/dev/null || true)
+  case " $cmd " in
+    *" capsled-alert:${want} "*) return 0 ;;
+  esac
+  return 1
+}
+
+child_pids() {
+  parent=$1
+  if command -v pgrep >/dev/null 2>&1; then
+    pgrep -P "$parent" 2>/dev/null || true
+    return
+  fi
+  ps -ax -o ppid=,pid= 2>/dev/null | while read -r pp cpid; do
+    [ "$pp" = "$parent" ] && printf '%s\n' "$cpid"
+  done
+}
+
+# Signal descendants of parent, deepest first. Caller signals parent.
+# Each pid is killed only if its ppid is still the parent we walked from.
+kill_tree() {
+  sig=$1
+  parent=$2
+  depth=$3
+  [ "$depth" -le 6 ] || return 0
+  kids=$(child_pids "$parent")
+  for k in $kids; do
+    case "$k" in
+      ''|*[!0-9]*) continue ;;
+    esac
+    [ "$k" -ge 2 ] || continue
+    pp=$(ps -p "$k" -o ppid= 2>/dev/null | tr -cd '0-9' || true)
+    [ "$pp" = "$parent" ] || continue
+    kill_tree "$sig" "$k" $((depth + 1))
+    pp=$(ps -p "$k" -o ppid= 2>/dev/null | tr -cd '0-9' || true)
+    if [ "$pp" = "$parent" ]; then
+      kill "-$sig" "$k" 2>/dev/null || true
+    fi
+  done
+}
+
+# Exported and re-executed with: nohup bash -c loop "capsled-alert:$tag"
+loop() {
+  marker="$DIR/$tag.on"
+  pidfile="$DIR/$tag.pid"
+  lock="$DIR/.lock-$tag"
+  child=0
+  holding=0
+  cleanup() {
+    trap - EXIT TERM INT
+    if [ "${child:-0}" -ge 2 ] 2>/dev/null; then
+      c=$child
+      child=0
+      pp=$(ps -p "$c" -o ppid= 2>/dev/null | tr -cd '0-9' || true)
+      if [ "$pp" = "$$" ]; then
+        kids=$(pgrep -P "$c" 2>/dev/null || true)
+        for k in $kids; do
+          case "$k" in
+            ''|*[!0-9]*) continue ;;
+          esac
+          ppk=$(ps -p "$k" -o ppid= 2>/dev/null | tr -cd '0-9' || true)
+          [ "$ppk" = "$c" ] && kill "$k" 2>/dev/null || true
+        done
+        kill "$c" 2>/dev/null || true
+      fi
+    fi
+    if [ "$holding" = 1 ]; then
+      rmdir "$lock" 2>/dev/null || true
+      holding=0
+    fi
+    if [ -f "$pidfile" ]; then
+      cur=$(tr -cd '0-9' < "$pidfile" || true)
+      [ "$cur" = "$$" ] && rm -f "$pidfile"
+    fi
+  }
+  trap 'cleanup; exit 0' TERM INT
+  trap 'cleanup' EXIT
+  while [ -f "$marker" ]; do
+    now=$(date +%s)
+    mt=$(stat -c %Y "$marker" 2>/dev/null || stat -f %m "$marker" 2>/dev/null || true)
+    if [ -n "$mt" ] && [ $((now - mt)) -ge $((MAXH * 3600)) ]; then
+      if mkdir "$lock" 2>/dev/null; then
+        holding=1
+        now=$(date +%s)
+        mt=$(stat -c %Y "$marker" 2>/dev/null || stat -f %m "$marker" 2>/dev/null || true)
+        if [ -n "$mt" ] && [ -f "$marker" ] && [ $((now - mt)) -ge $((MAXH * 3600)) ]; then
+          rm -f "$marker"
+        fi
+        rmdir "$lock" 2>/dev/null || true
+        holding=0
+      fi
+      [ -f "$marker" ] || break
+    fi
+    [ -f "$marker" ] || break
+    child=0
+    "$HOME/bin/capsled" 3 "$KB" &
+    child=$!
+    wait "$child" || true
+    child=0
+    [ -f "$marker" ] || break
+    sleep 4 &
+    child=$!
+    wait "$child" || true
+    child=0
+  done
+}
+
+lockdir=
+lock_acquire() {
+  want="$DIR/.lock-$1"
+  n=0
+  while ! mkdir "$want" 2>/dev/null; do
+    n=$((n + 1))
+    if [ "$n" -ge 100 ]; then
+      now=$(date +%s)
+      mt=$(file_mtime "$want")
+      if [ -n "$mt" ] && [ $((now - mt)) -ge 15 ]; then
+        rmdir "$want" 2>/dev/null || true
+        continue
+      fi
+    fi
+    if [ "$n" -ge 200 ]; then
+      echo "capsled-alert: '$1' is busy" >&2
+      return 1
+    fi
+    sleep 0.05
+  done
+  lockdir=$want
+}
+
+lock_release() {
+  if [ -n "${lockdir:-}" ]; then
+    rmdir "$lockdir" 2>/dev/null || true
+    lockdir=
+  fi
+}
+
+cmd_start() {
+  tag=$(sanitize "${1:-}")
+  mkdir -p "$DIR" || { echo "capsled-alert: cannot create $DIR" >&2; return 1; }
+  chmod 700 "$DIR" 2>/dev/null || true
+  lock_acquire "$tag" || return 1
+  marker="$DIR/$tag.on"
+  pidfile="$DIR/$tag.pid"
+  touch "$marker" || { lock_release; return 1; }
+  old=""
+  if [ -f "$pidfile" ]; then
+    old=$(tr -cd '0-9' < "$pidfile" || true)
+  fi
+  if ours "$old" "$tag"; then
+    echo "already running: $tag"
+    lock_release
+    return 0
+  fi
+  rm -f "$pidfile"
+  : > "$DIR/$tag.log" || true
+  export DIR KB MAXH tag
+  export -f loop
+  nohup "$BASH" -c loop "capsled-alert:$tag" >>"$DIR/$tag.log" 2>&1 </dev/null &
+  newpid=$!
+  echo "$newpid" > "$pidfile"
+  disown "$newpid" 2>/dev/null || true
+  i=0
+  ok=0
+  while [ "$i" -lt 40 ]; do
+    if ours "$newpid" "$tag"; then
+      ok=1
+      break
+    fi
+    kill -0 "$newpid" 2>/dev/null || break
+    i=$((i + 1))
+    sleep 0.05
+  done
+  if [ "$ok" -ne 1 ]; then
+    echo "capsled-alert: failed to start '$tag'" >&2
+    cmd=$(ps -p "$newpid" -o args= 2>/dev/null || true)
+    case "$cmd" in
+      *"capsled-alert:${tag}"*) kill "$newpid" 2>/dev/null || true ;;
+    esac
+    rm -f "$pidfile" "$marker"
+    lock_release
+    return 1
+  fi
+  echo "started: $tag"
+  lock_release
+}
+
+cmd_stop_one() {
+  tag=$1
+  if [ ! -d "$DIR" ]; then
+    echo "stopped: $tag"
+    return 0
+  fi
+  lock_acquire "$tag" || return 1
+  rm -f "$DIR/$tag.on"
+  pid=""
+  if [ -f "$DIR/$tag.pid" ]; then
+    pid=$(tr -cd '0-9' < "$DIR/$tag.pid" || true)
+  fi
+  if ours "$pid" "$tag"; then
+    kill_tree TERM "$pid" 0
+    kill -TERM "$pid" 2>/dev/null || true
+    i=0
+    while ours "$pid" "$tag" && [ "$i" -lt 25 ]; do
+      sleep 0.1
+      i=$((i + 1))
+    done
+    if ours "$pid" "$tag"; then
+      kill_tree KILL "$pid" 0
+      kill -KILL "$pid" 2>/dev/null || true
+    fi
+  fi
+  if [ -f "$DIR/$tag.pid" ]; then
+    cur=$(tr -cd '0-9' < "$DIR/$tag.pid" || true)
+    if [ "$cur" = "$pid" ] || ! ours "$cur" "$tag"; then
+      rm -f "$DIR/$tag.pid"
+    fi
+  fi
+  echo "stopped: $tag"
+  lock_release
+}
+
+any_live() {
+  [ -d "$DIR" ] || return 1
+  for f in "$DIR"/*.on; do
+    [ -f "$f" ] || continue
+    base=$(basename "$f" .on)
+    case "$base" in
+      *[!A-Za-z0-9._-]*) continue ;;
+    esac
+    pid=""
+    if [ -f "$DIR/$base.pid" ]; then
+      pid=$(tr -cd '0-9' < "$DIR/$base.pid" || true)
+    fi
+    if ours "$pid" "$base"; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+list_tags() {
+  [ -d "$DIR" ] || return 0
+  find "$DIR" -maxdepth 1 -type f \( -name '*.on' -o -name '*.pid' \) 2>/dev/null \
+    | while read -r f; do
+        b=$(basename "$f")
+        case "$b" in
+          *.on) b=${b%.on} ;;
+          *.pid) b=${b%.pid} ;;
+          *) continue ;;
+        esac
+        case "$b" in
+          ''|*[!A-Za-z0-9._-]*) ;;
+          *) printf '%s\n' "$b" ;;
+        esac
+      done | sort -u
+}
+
+cmd_stop_all() {
+  if [ ! -d "$DIR" ]; then
+    echo "stopped: no alerts"
+    return 0
+  fi
+  list_tags > "$DIR/.stop-list" || true
+  if [ ! -s "$DIR/.stop-list" ]; then
+    rm -f "$DIR/.stop-list"
+    echo "stopped: no alerts"
+    return 0
+  fi
+  rc=0
+  while IFS= read -r t; do
+    [ -n "$t" ] || continue
+    cmd_stop_one "$t" || rc=$?
+  done < "$DIR/.stop-list"
+  rm -f "$DIR/.stop-list"
+  return "$rc"
+}
+
+led_off() {
+  bin="$HOME/bin/capsled"
+  [ -x "$bin" ] || return 0
+  "$bin" 0 "$KB" 0 || true
+}
+
+cmd_status() {
+  lines=""
+  if [ -d "$DIR" ]; then
+    for f in "$DIR"/*.on; do
+      [ -f "$f" ] || continue
+      base=$(basename "$f" .on)
+      case "$base" in
+        *[!A-Za-z0-9._-]*) continue ;;
+      esac
+      pid=""
+      if [ -f "$DIR/$base.pid" ]; then
+        pid=$(tr -cd '0-9' < "$DIR/$base.pid" || true)
+      fi
+      if ours "$pid" "$base"; then
+        lines="${lines}${base}
+"
+      fi
+    done
+  fi
+  if [ -z "$lines" ]; then
+    echo "no active alerts"
+  else
+    printf '%s' "$lines" | sort
+  fi
+}
+
+case "${1:-}" in
+  start)
+    [ $# -le 2 ] || { usage; exit 1; }
+    cmd_start "${2:-}"
+    ;;
+  stop)
+    [ $# -le 2 ] || { usage; exit 1; }
+    if [ $# -eq 1 ]; then
+      cmd_stop_all || exit 1
+    else
+      cmd_stop_one "$(sanitize "$2")" || exit 1
+    fi
+    if ! any_live; then
+      led_off
+    fi
+    ;;
+  status)
+    [ $# -eq 1 ] || { usage; exit 1; }
+    cmd_status
+    ;;
+  *)
+    usage
+    exit 1
+    ;;
+esac
